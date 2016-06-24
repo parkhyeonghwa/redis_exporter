@@ -144,11 +144,58 @@ func includeMetric(name string) bool {
 		"used_cpu_sys_children":  true,
 		"used_cpu_user_children": true,
 
-		"repl_backlog_size": true,
+		/*
+		   master_repl_offset:25075
+		   repl_backlog_active:1
+		   repl_backlog_size:1048576
+		   repl_backlog_first_byte_offset:2
+		   repl_backlog_histlen:25074
+		*/
+
+		"master_repl_offset":             true,
+		"repl_backlog_active":            true,
+		"repl_backlog_size":              true,
+		"repl_backlog_first_byte_offset": true,
+		"repl_backlog_histlen":           true,
+
+		"cluster_enabled": true,
 	}
 
 	if strings.HasPrefix(name, "db") {
 		return true
+	}
+
+	_, ok := incl[name]
+
+	return ok
+}
+
+func includeClusterInfoMetric(name string) bool {
+
+	incl := map[string]bool{
+		/*
+		   cluster_state:ok
+		   cluster_slots_assigned:16384
+		   cluster_slots_ok:16384
+		   cluster_slots_pfail:0
+		   cluster_slots_fail:0
+		   cluster_known_nodes:8
+		   cluster_size:4
+		   cluster_current_epoch:8
+		   cluster_my_epoch:6
+		   cluster_stats_messages_sent:30271
+		   cluster_stats_messages_received:30266
+		*/
+		"cluster_state":                   true,
+		"cluster_slots_assigned":          true,
+		"cluster_slots_ok":                true,
+		"cluster_slots_pfail":             true,
+		"cluster_slots_fail":              true,
+		"cluster_known_nodes":             true,
+		"cluster_size":                    true,
+		"cluster_current_epoch":           true,
+		"cluster_stats_messages_sent":     true,
+		"cluster_stats_messages_received": true,
 	}
 
 	_, ok := incl[name]
@@ -213,6 +260,31 @@ func extractInfoMetrics(info, addr string, scrapes chan<- scrapeResult) error {
 	return nil
 }
 
+//cluster info
+func extractClusterInfoMetrics(clusterinfo, addr string, scrapes chan<- scrapeResult) error {
+
+	lines := strings.Split(clusterinfo, "\r\n")
+
+	for _, line := range lines {
+
+		if (len(line) < 2) || line[0] == '#' || (!strings.Contains(line, ":")) {
+			continue
+		}
+		split := strings.Split(line, ":")
+		if len(split) != 2 || !includeClusterInfoMetric(split[0]) {
+			continue
+		}
+
+		val, err := strconv.ParseFloat(split[1], 64)
+		if err != nil {
+			log.Printf("couldn't parse %s, err: %s", split[1], err)
+			continue
+		}
+		scrapes <- scrapeResult{Name: split[0], Addr: addr, Value: val}
+	}
+	return nil
+}
+
 func extractConfigMetrics(config []string, addr string, scrapes chan<- scrapeResult) error {
 
 	if len(config)%2 != 0 {
@@ -251,6 +323,7 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 				continue
 			}
 		}
+		//info
 		info, err := redis.String(c.Do("INFO"))
 		if err == nil {
 			err = extractInfoMetrics(info, addr, scrapes)
@@ -259,7 +332,16 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 			log.Printf("redis err: %s", err)
 			errorCount++
 		}
-
+		//cluster info
+		clusterinfo, err := redis.String(c.Do("CLUSTER", "INFO"))
+		if err == nil {
+			err = extractClusterInfoMetrics(clusterinfo, addr, scrapes)
+		}
+		if err != nil {
+			log.Printf("redis err: %s", err)
+			errorCount++
+		}
+		//config
 		config, err := redis.Strings(c.Do("CONFIG", "GET", "maxmemory"))
 		if err == nil {
 			err = extractConfigMetrics(config, addr, scrapes)
