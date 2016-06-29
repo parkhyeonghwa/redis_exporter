@@ -157,6 +157,7 @@ func includeMetric(name string) bool {
 		"aof_last_write_status":       true,
 
 		"master_repl_offset":             true,
+		"master_last_io_seconds_ago":     true,
 		"repl_backlog_active":            true,
 		"repl_backlog_size":              true,
 		"repl_backlog_first_byte_offset": true,
