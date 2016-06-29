@@ -144,13 +144,17 @@ func includeMetric(name string) bool {
 		"used_cpu_sys_children":  true,
 		"used_cpu_user_children": true,
 
-		/*
-		   master_repl_offset:25075
-		   repl_backlog_active:1
-		   repl_backlog_size:1048576
-		   repl_backlog_first_byte_offset:2
-		   repl_backlog_histlen:25074
-		*/
+		"loading":                     true,
+		"rdb_changes_since_last_save": true,
+		"rdb_bgsave_in_progress":      true,
+		"rdb_last_save_time":          true,
+		"rdb_last_bgsave_status":      true,
+		"rdb_last_bgsave_time_sec":    true,
+		"aof_enabled":                 true,
+		"aof_rewrite_in_progress":     true,
+		"aof_rewrite_scheduled":       true,
+		"aof_last_bgrewrite_status":   true,
+		"aof_last_write_status":       true,
 
 		"master_repl_offset":             true,
 		"repl_backlog_active":            true,
@@ -173,19 +177,6 @@ func includeMetric(name string) bool {
 func includeClusterInfoMetric(name string) bool {
 
 	incl := map[string]bool{
-		/*
-		   cluster_state:ok
-		   cluster_slots_assigned:16384
-		   cluster_slots_ok:16384
-		   cluster_slots_pfail:0
-		   cluster_slots_fail:0
-		   cluster_known_nodes:8
-		   cluster_size:4
-		   cluster_current_epoch:8
-		   cluster_my_epoch:6
-		   cluster_stats_messages_sent:30271
-		   cluster_stats_messages_received:30266
-		*/
 		"cluster_state":                   true,
 		"cluster_slots_assigned":          true,
 		"cluster_slots_ok":                true,
@@ -194,6 +185,7 @@ func includeClusterInfoMetric(name string) bool {
 		"cluster_known_nodes":             true,
 		"cluster_size":                    true,
 		"cluster_current_epoch":           true,
+		"cluster_my_epoch":                true,
 		"cluster_stats_messages_sent":     true,
 		"cluster_stats_messages_received": true,
 	}
@@ -214,6 +206,15 @@ func extractInfoMetrics(info, addr string, scrapes chan<- scrapeResult) error {
 		}
 		split := strings.Split(line, ":")
 		if len(split) != 2 || !includeMetric(split[0]) {
+			continue
+		}
+		// status: ok or fail
+		if strings.HasPrefix(split[1], "ok") {
+			scrapes <- scrapeResult{Name: split[0], Addr: addr, Value: 1}
+			continue
+		}
+		if strings.HasPrefix(split[1], "fail") {
+			scrapes <- scrapeResult{Name: split[0], Addr: addr, Value: 0}
 			continue
 		}
 
@@ -275,12 +276,39 @@ func extractClusterInfoMetrics(clusterinfo, addr string, scrapes chan<- scrapeRe
 			continue
 		}
 
+		// status: ok or fail
+		if strings.HasPrefix(split[1], "ok") {
+			scrapes <- scrapeResult{Name: split[0], Addr: addr, Value: 1}
+			continue
+		}
+		if strings.HasPrefix(split[1], "fail") {
+			scrapes <- scrapeResult{Name: split[0], Addr: addr, Value: 0}
+			continue
+		}
+
 		val, err := strconv.ParseFloat(split[1], 64)
 		if err != nil {
 			log.Printf("couldn't parse %s, err: %s", split[1], err)
 			continue
 		}
 		scrapes <- scrapeResult{Name: split[0], Addr: addr, Value: val}
+
+	}
+	return nil
+}
+
+func extractClusterNodesMetrics(nodes, addr string, scrapes chan<- scrapeResult) error {
+
+	lines := strings.Split(nodes, "\r\n")
+
+	for _, line := range lines {
+		split := strings.Split(line, "\n")
+		rows := strings.Count(line, "\n")
+		for pos := 0; pos < rows; pos++ {
+			scrapes <- scrapeResult{Name: fmt.Sprintf("cluster_nodes_stats"), Addr: fmt.Sprint(split[pos]), Value: 1}
+		}
+		continue
+
 	}
 	return nil
 }
@@ -298,6 +326,38 @@ func extractConfigMetrics(config []string, addr string, scrapes chan<- scrapeRes
 			continue
 		}
 		scrapes <- scrapeResult{Name: fmt.Sprintf("config_%s", config[pos*2]), Addr: addr, Value: val}
+	}
+	return nil
+}
+
+func extractMemoryPolicyMetrics(maxmemorypolicy []string, addr string, scrapes chan<- scrapeResult) error {
+
+	if len(maxmemorypolicy)%2 != 0 {
+		return fmt.Errorf("invalid config: %#v", maxmemorypolicy)
+	}
+
+	for pos := 0; pos < len(maxmemorypolicy)/2; pos++ {
+		if strings.HasPrefix(maxmemorypolicy[pos*2+1], "volatile-lru") {
+			scrapes <- scrapeResult{Name: fmt.Sprintf("config_%s", strings.Replace(maxmemorypolicy[pos*2], "-", "_", 1)), Addr: addr, Value: 1}
+			continue
+		}
+		if strings.HasPrefix(maxmemorypolicy[pos*2+1], "allkeys-lru") {
+			scrapes <- scrapeResult{Name: fmt.Sprintf("config_%s", strings.Replace(maxmemorypolicy[pos*2], "-", "_", 1)), Addr: addr, Value: 2}
+			continue
+		}
+		if strings.HasPrefix(maxmemorypolicy[pos*2+1], "volatile-random") {
+			scrapes <- scrapeResult{Name: fmt.Sprintf("config_%s", strings.Replace(maxmemorypolicy[pos*2], "-", "_", 1)), Addr: addr, Value: 3}
+			continue
+		}
+		if strings.HasPrefix(maxmemorypolicy[pos*2+1], "volatile-ttl") {
+			scrapes <- scrapeResult{Name: fmt.Sprintf("config_%s", strings.Replace(maxmemorypolicy[pos*2], "-", "_", 1)), Addr: addr, Value: 4}
+			continue
+		}
+		if strings.HasPrefix(maxmemorypolicy[pos*2+1], "noeviction") {
+			scrapes <- scrapeResult{Name: fmt.Sprintf("config_%s", strings.Replace(maxmemorypolicy[pos*2], "-", "_", 1)), Addr: addr, Value: 5}
+			continue
+		}
+
 	}
 	return nil
 }
@@ -341,10 +401,28 @@ func (e *Exporter) scrape(scrapes chan<- scrapeResult) {
 			log.Printf("redis err: %s", err)
 			errorCount++
 		}
+		//cluster nodes
+		nodes, err := redis.String(c.Do("CLUSTER", "NODES"))
+		if err == nil {
+			err = extractClusterNodesMetrics(nodes, addr, scrapes)
+		}
+		if err != nil {
+			log.Printf("redis err: %s", err)
+			errorCount++
+		}
 		//config
 		config, err := redis.Strings(c.Do("CONFIG", "GET", "maxmemory"))
 		if err == nil {
 			err = extractConfigMetrics(config, addr, scrapes)
+		}
+		if err != nil {
+			log.Printf("redis err: %s", err)
+			errorCount++
+		}
+		//config get maxmemory-policy
+		maxmemorypolicy, err := redis.Strings(c.Do("CONFIG", "GET", "maxmemory-policy"))
+		if err == nil {
+			err = extractMemoryPolicyMetrics(maxmemorypolicy, addr, scrapes)
 		}
 		if err != nil {
 			log.Printf("redis err: %s", err)
